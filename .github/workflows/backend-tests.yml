@@ -1,4 +1,4 @@
-name: Backend tests
+name: Backend tests and firmware build
 
 on:
   push:
@@ -51,4 +51,36 @@ jobs:
         run: python manage.py makemigrations --check --dry-run
 
       - name: Run test suite
-        run: python manage.py test assistant -v 2
+        run: python manage.py test assistant -v 2 --noinput
+
+  firmware:
+    # Compiles the M5StickS3 firmware. No hardware and no real secrets are needed:
+    # the example secrets header (placeholders only) is used for the build.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Use placeholder secrets
+        run: cp include/secrets.example.h include/secrets.h
+
+      - name: Build firmware
+        run: pio run -e m5sticks3

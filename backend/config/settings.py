@@ -48,6 +48,20 @@ OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "") or "low"
 OPENAI_TIMEOUT_SECONDS = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "") or 30)
 DEVICE_API_TOKEN = os.environ.get("DEVICE_API_TOKEN", "")
 
+# --- Voice (Stage 2) ------------------------------------------------------------
+OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "") or "gpt-4o-mini-transcribe"
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "") or "gpt-4o-mini-tts"
+OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "") or "marin"
+# Upload limits for device recordings (WAV, mono, 16-bit PCM).
+VOICE_MAX_SECONDS = float(os.environ.get("VOICE_MAX_SECONDS", "") or 12)
+VOICE_MIN_SECONDS = 0.3
+# Generated reply audio is kept for this long, then regenerated on demand.
+VOICE_AUDIO_TTL_SECONDS = int(os.environ.get("VOICE_AUDIO_TTL_SECONDS", "") or 3600)
+# Request records (transcript + reply, never raw audio) are kept for idempotency.
+VOICE_REQUEST_RETENTION_HOURS = int(os.environ.get("VOICE_REQUEST_RETENTION_HOURS", "") or 72)
+# Output sample rate of the WAV sent to the device (OpenAI PCM is 24 kHz).
+VOICE_OUTPUT_SAMPLE_RATE = int(os.environ.get("VOICE_OUTPUT_SAMPLE_RATE", "") or 24000)
+
 # --- Application definition --------------------------------------------------
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -92,6 +106,16 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        "OPTIONS": {
+            # Wait for a competing writer (e.g. a device retry) instead of failing
+            # immediately, and take the write lock at BEGIN to avoid lock-upgrade
+            # deadlocks between concurrent requests.
+            "timeout": 20,
+            "transaction_mode": "IMMEDIATE",
+        },
+        # File-based test database so tests see the same locking behaviour as
+        # production (the default in-memory shared cache fails fast on contention).
+        "TEST": {"NAME": BASE_DIR / "test_db.sqlite3"},
     }
 }
 
@@ -114,7 +138,10 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # The device only sends short text messages; reject large bodies early.
+# (Voice uploads are size-checked separately in the voice views.)
 DATA_UPLOAD_MAX_MEMORY_SIZE = 64 * 1024
+# Keep uploaded recordings in memory so raw audio is never written to disk.
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
 
 # --- Security (production) ---------------------------------------------------
 if not DEBUG:

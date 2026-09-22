@@ -1,6 +1,6 @@
-# Stick Assistant — Stage 1 backend
+# Stick Assistant
 
-A personal AI assistant for one person and one device (a future M5StickS3).
+A personal AI assistant for one person and one device, an M5Stack M5StickS3.
 It understands Romanian and English, keeps a persistent agenda of **tasks** and
 **appointments** in SQLite, and uses the OpenAI Responses API with function
 calling to turn natural language into validated database operations.
@@ -14,8 +14,13 @@ You: Marchează-l ca finalizat.
 Assistant: Am marcat taskul ca finalizat.
 ```
 
-Stage 1 is text-only: a terminal chat plus a small JSON API. No firmware, audio,
-speech-to-text or text-to-speech yet.
+- **Stage 1:** Django backend, agenda, OpenAI function calling, terminal chat
+  and a JSON API.
+- **Stage 2:** voice. The M5StickS3 records while you hold a button. The server
+  transcribes the recording (`gpt-4o-mini-transcribe`), runs the same
+  orchestrator, and answers with speech (`gpt-4o-mini-tts`, voice `marin`),
+  which the device plays. Firmware and flashing instructions:
+  [firmware/README.md](firmware/README.md).
 
 ---
 
@@ -60,7 +65,43 @@ HTTP API (/api/chat/)      ─┘        │                 │ function calls
 | `backend/assistant/services/orchestrator.py` | Tool-calling loop, prompt, conversation handling |
 | `backend/assistant/services/session.py` | Bounded in-memory session state |
 | `backend/assistant/management/commands/assistant_chat.py` | Terminal interface |
-| `backend/assistant/views.py` | JSON API (`/api/health/`, `/api/chat/`, `/api/agenda/today/`) |
+| `backend/assistant/views.py` | JSON API (health, chat, agenda, voice endpoints) |
+| `backend/assistant/services/transcription.py` | WAV validation, silence gate, OpenAI speech-to-text |
+| `backend/assistant/services/speech.py` | OpenAI text-to-speech → PCM WAV (optional server-side resampling) |
+| `backend/assistant/services/voice.py` | Voice pipeline, idempotent `request_id` handling, Button B agenda summary |
+| `firmware/` | M5StickS3 PlatformIO firmware (see its README) |
+
+### Voice pipeline (Stage 2)
+
+```
+M5StickS3 ──WAV 16 kHz──► POST /api/voice/ ──► VoiceRequest row (request_id = PK, SHA-256)
+                                               │
+                        validate WAV ─► transcribe ─► Orchestrator (same as terminal/chat)
+                                               │         └─ tools ─► agenda ─► SQLite
+                              outcome committed to SQLite BEFORE speech is generated
+                                               │
+                        TTS (pcm 24 kHz) ─► WAV stored ≤ 1 h ─► GET /api/voice/audio/<id>/
+```
+
+**Idempotency.**
+- The device's `request_id` is the primary key of `VoiceRequest`, so SQLite
+  guarantees one execution per id. The recording's SHA-256 is stored with it;
+  reusing an id with different audio returns `409`.
+- Each request records its progress in `stage`: `RECEIVED` → `TRANSCRIBED` →
+  `EXECUTING` → `EXECUTED`.
+- A retry of a completed request returns the stored result without running
+  anything again.
+- A request that failed before `EXECUTING` (transcription or OpenAI failed, so
+  nothing touched the agenda) may be re-run with the same id.
+- A request interrupted during `EXECUTING` is never re-run; it is reported as
+  `interrupted`.
+- If speech generation fails, the database result is kept. Audio is regenerated
+  on demand from the stored reply text, without repeating the agenda operation.
+
+**Storage.** Raw recordings are only held in memory and never written to disk
+or the database. Generated reply audio expires after `VOICE_AUDIO_TTL_SECONDS`.
+Request records (hash, transcript, reply) are deleted after
+`VOICE_REQUEST_RETENTION_HOURS`.
 
 **How a message is handled:** the user message, the current date/time and
 two-week calendar, and the recently referenced items (real UUIDs from SQLite)
@@ -112,6 +153,13 @@ Default model check (22/09/2026):
   `store=False`, `reasoning.effort=low`,
   `include=["reasoning.encrypted_content"]`, strict function tools and
   `parallel_tool_calls`.
+| `OPENAI_TRANSCRIBE_MODEL` | no (default `gpt-4o-mini-transcribe`) | Speech-to-text model |
+| `OPENAI_TTS_MODEL` | no (default `gpt-4o-mini-tts`) | Text-to-speech model |
+| `OPENAI_TTS_VOICE` | no (default `marin`) | TTS voice, e.g. `marin` or `cedar` |
+| `VOICE_MAX_SECONDS` | no (default `12`) | Longest accepted recording |
+| `VOICE_AUDIO_TTL_SECONDS` | no (default `3600`) | How long generated reply audio is kept |
+| `VOICE_REQUEST_RETENTION_HOURS` | no (default `72`) | How long request records (no audio) are kept for idempotency |
+| `VOICE_OUTPUT_SAMPLE_RATE` | no (default `24000`) | Sample rate of reply WAVs (OpenAI PCM is 24 kHz; other rates are resampled on the server) |
 | `DJANGO_SECRET_KEY` | yes in production | Long random string |
 | `DJANGO_DEBUG` | no (default `False`) | `True` for local development |
 | `DJANGO_ALLOWED_HOSTS` | no | Comma-separated, default `localhost,127.0.0.1` |
@@ -199,7 +247,59 @@ curl -X POST http://127.0.0.1:8000/api/chat/ \
   -d '{"message": "What do I have tomorrow?"}'
 ```
 
-Status codes:
+### Voice endpoints (Stage 2)
+
+All voice endpoints require the device token.
+
+| Method | Path | Body / response |
+|---|---|---|
+| POST | `/api/voice/` | `multipart/form-data`: `audio` (WAV, mono, 16-bit PCM, 8–48 kHz, 0.3–12 s) and `request_id` (UUID made by the device; reuse it on retries). Response JSON below. |
+| GET | `/api/voice/requests/<request_id>/` | The same JSON; use it after an interrupted upload or while `status` is `processing` |
+| GET | `/api/voice/audio/<request_id>/` | `audio/wav` (binary, mono 16-bit PCM, 24 kHz by default). Regenerated from the stored reply if expired; the agenda is never touched. |
+| POST | `/api/voice/agenda/` | JSON `{"request_id": "<uuid>", "language": "ro"}` (or `"en"`). Returns a spoken summary of today's agenda, built from SQLite (read-only, no AI call). |
+
+Voice response JSON (never contains base64 audio):
+
+```json
+{
+  "request_id": "0b3c…",
+  "status": "success",
+  "stage": "EXECUTED",
+  "transcript": "Amintește-mi mâine la 10 să sun la dentist.",
+  "reply": "Am salvat taskul pentru mâine la ora 10.",
+  "error": null,
+  "retryable": false,
+  "audio_url": "/api/voice/audio/0b3c…/",
+  "audio_ready": true
+}
+```
+
+- `status` values:
+  - `success`;
+  - `no_speech`: silence or an empty transcript; `reply` asks to try again;
+  - `processing`: HTTP 202;
+  - `error`: `reply` holds a message that can be spoken;
+  - `busy`: HTTP 429.
+- Voice HTTP codes:
+  - `400`: bad `request_id`, corrupt, too short or too long audio;
+  - `409`: `request_id` reused with different audio;
+  - `411`: no Content-Length;
+  - `413`: too large;
+  - `415`: not 16-bit mono PCM WAV;
+  - `502`: failure. Check `retryable`: `true` means nothing touched the agenda,
+    so the same id can be retried.
+
+Test from the PC with a fixture recording:
+
+```powershell
+$id = [guid]::NewGuid().ToString()
+curl.exe -s -H "Authorization: Bearer $token" `
+  -F "request_id=$id" -F "audio=@backend/assistant/fixtures/voice/ro_query_tomorrow.wav;type=audio/wav" `
+  http://127.0.0.1:8000/api/voice/
+curl.exe -s -H "Authorization: Bearer $token" -o reply.wav http://127.0.0.1:8000/api/voice/audio/$id/
+```
+
+Status codes (all endpoints):
 
 | Code | Meaning |
 |---|---|
@@ -237,9 +337,40 @@ tool validation, the orchestration loop, follow-up references, ambiguity,
 delete confirmation, error handling and the HTTP API. Regression tests for
 defects found in the audit are in `test_regressions.py`.
 
-**CI:** `.github/workflows/backend-tests.yml` runs the checks and the full suite
-on every push to `main` and on every pull request to `main`. It uses Python 3.11,
-safe dummy settings and no OpenAI key, so it makes no paid API calls.
+**CI:** `.github/workflows/backend-tests.yml` runs on every push to `main` and
+on every pull request to `main`, using Python 3.11, safe dummy settings and no
+OpenAI key, so it makes no paid API calls. It has two jobs:
+- the backend checks and the full test suite;
+- a PlatformIO build of the M5StickS3 firmware with placeholder secrets and no
+  hardware.
+
+The voice tests (`test_voice.py`) use generated WAVs and fake OpenAI clients.
+They cover:
+- WAV validation (empty, corrupted, wrong format, too large, too long);
+- transcription and TTS success and failure;
+- a TTS failure after a successful agenda change;
+- protected and expired audio;
+- duplicate or conflicting `request_id`s, and concurrent duplicates (real
+  threads on a file-based SQLite test database);
+- recovery after an interruption;
+- audio regenerated without repeating the agenda operation;
+- a spoken "Nu" that must not confirm a deletion.
+
+**Live voice check (optional, real OpenAI audio + LLM calls, costs a few cents):**
+
+```powershell
+python manage.py assistant_voice_check
+```
+
+This command:
+- uploads the real speech recordings in `backend/assistant/fixtures/voice/`
+  (16 kHz mono WAV) through the actual HTTP voice endpoints;
+- checks SQLite after each step (create, retry without duplicate, 409, query,
+  "Mută-l la ora 12", Button B summary, delete then "Nu", English);
+- validates the returned WAV audio;
+- removes only the records it created.
+
+It never runs in CI.
 
 **Live OpenAI check (optional, uses your API key and costs a few API calls):**
 
@@ -274,8 +405,18 @@ works; this command does.**
 - `check --deploy` warns about HSTS until `DJANGO_HSTS_SECONDS` is set. Enable it
   only when the site is served exclusively over HTTPS.
 
-## 11. Next stage (Stage 2)
+- **Voice:**
+  - Push-to-talk only; there is no wake word or continuous listening.
+  - The firmware compiles in CI but still needs to be checked on a physical
+    M5StickS3 (see the checklist in `firmware/README.md`).
+  - Reply audio is downloaded completely before playback starts.
+  - The display shows Romanian text without diacritics.
+  - Transcription can mishear, so the assistant asks you to repeat when a
+    command is unclear.
+- Voice and `/api/chat/` share one device conversation per server process. The
+  terminal chat has its own session.
 
-- M5StickS3 firmware talking to `/api/chat/` over HTTPS.
-- Audio endpoints: speech-to-text for input, text-to-speech for replies.
-- Possibly persistent conversation state and reminders.
+## 11. Next stage
+
+- Stage 3 (not started): for example reminders or notifications, streaming
+  audio playback, and HTTPS deployment for use outside the home network.

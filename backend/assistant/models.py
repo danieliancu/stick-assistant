@@ -114,3 +114,61 @@ class AgendaItem(models.Model):
             raise ValidationError({"status": f"Invalid status: {self.status}."})
         self._validate_status_transition()
         super().save(*args, **kwargs)
+
+
+class VoiceRequest(models.Model):
+    """
+    Execution record for one device voice request, keyed by the device-generated
+    request_id. Makes retries idempotent: the agenda operation for a request runs
+    at most once, and its outcome is persisted before any speech is generated.
+    Raw recordings are never stored, only their SHA-256.
+    """
+
+    class Kind(models.TextChoices):
+        VOICE = "VOICE", "Voice command"
+        AGENDA_SUMMARY = "AGENDA_SUMMARY", "Today's agenda summary"
+
+    class Status(models.TextChoices):
+        PROCESSING = "PROCESSING", "Processing"
+        COMPLETED = "COMPLETED", "Completed"
+        FAILED = "FAILED", "Failed"
+
+    class Stage(models.TextChoices):
+        RECEIVED = "RECEIVED", "Received"            # nothing executed yet
+        TRANSCRIBED = "TRANSCRIBED", "Transcribed"   # nothing executed yet
+        EXECUTING = "EXECUTING", "Executing"         # agenda may be changing
+        EXECUTED = "EXECUTED", "Executed"            # outcome persisted
+
+    # Stages in which no agenda operation can have started: safe to run again.
+    SAFE_TO_RETRY_STAGES = {Stage.RECEIVED, Stage.TRANSCRIBED}
+
+    id = models.UUIDField(primary_key=True, editable=False)
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.VOICE)
+    payload_sha256 = models.CharField(max_length=64)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCESSING)
+    stage = models.CharField(max_length=20, choices=Stage.choices, default=Stage.RECEIVED)
+    outcome = models.CharField(max_length=20, blank=True, default="")
+    error_code = models.CharField(max_length=50, blank=True, default="")
+    transcript = models.TextField(blank=True, default="")
+    reply_text = models.TextField(blank=True, default="")
+    language = models.CharField(max_length=5, blank=True, default="")
+    actions = models.JSONField(default=list, blank=True)
+    audio = models.BinaryField(null=True, blank=True, editable=False)
+    audio_expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["created_at"]), models.Index(fields=["audio_expires_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.kind} {self.id} {self.status}/{self.stage}"
+
+    @property
+    def is_safe_to_retry(self) -> bool:
+        return self.stage in self.SAFE_TO_RETRY_STAGES
+
+    def has_audio(self, now=None) -> bool:
+        now = now or timezone.now()
+        return bool(self.audio) and (self.audio_expires_at is None or self.audio_expires_at > now)

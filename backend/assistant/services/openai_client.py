@@ -55,12 +55,8 @@ class OpenAIResponsesClient:
 
     @property
     def client(self) -> openai.OpenAI:
-        if not self.api_key:
-            raise AssistantConfigError(
-                "OPENAI_API_KEY is not configured. Add it to backend/.env or the environment."
-            )
         if self._client is None:
-            self._client = openai.OpenAI(api_key=self.api_key, timeout=self.timeout, max_retries=2)
+            self._client = build_openai_client(self.api_key, self.timeout)
         return self._client
 
     @property
@@ -89,31 +85,42 @@ class OpenAIResponsesClient:
         client = self.client
         try:
             return client.responses.create(**request)
-        except openai.AuthenticationError as exc:
-            logger.error("OpenAI authentication failed (status %s)", exc.status_code)
-            raise AssistantConfigError("The OpenAI API key was rejected.") from exc
-        except openai.PermissionDeniedError as exc:
-            logger.error("OpenAI permission denied for model %s", self.model)
-            raise AssistantConfigError(
-                f"The API key has no access to model '{self.model}'."
-            ) from exc
-        except openai.NotFoundError as exc:
-            logger.error("OpenAI model not found: %s", self.model)
-            raise AssistantConfigError(
-                f"Model '{self.model}' was not found. Check OPENAI_MODEL."
-            ) from exc
-        except openai.BadRequestError as exc:
-            logger.error("OpenAI rejected the request (model %s): %s", self.model, exc.message)
-            raise AssistantConfigError(
-                f"OpenAI rejected the request for model '{self.model}'. Check OPENAI_MODEL and "
-                "OPENAI_REASONING_EFFORT (see server log)."
-            ) from exc
-        except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError) as exc:
-            logger.warning("OpenAI temporarily unavailable: %s", type(exc).__name__)
-            raise AssistantUnavailableError("The AI service is temporarily unavailable.") from exc
-        except openai.APIStatusError as exc:
-            logger.error("OpenAI API error (status %s)", exc.status_code)
-            raise AssistantUnavailableError("The AI service returned an error.") from exc
         except openai.OpenAIError as exc:
-            logger.error("OpenAI client error: %s", type(exc).__name__)
-            raise AssistantUnavailableError("The AI service could not be reached.") from exc
+            raise map_openai_error(exc, self.model) from exc
+
+
+def build_openai_client(api_key: str, timeout: float) -> openai.OpenAI:
+    if not api_key:
+        raise AssistantConfigError(
+            "OPENAI_API_KEY is not configured. Add it to backend/.env or the environment."
+        )
+    return openai.OpenAI(api_key=api_key, timeout=timeout, max_retries=2)
+
+
+def map_openai_error(exc: openai.OpenAIError, model: str) -> AssistantError:
+    """Translate an SDK exception into an app error whose message never contains secrets."""
+    if isinstance(exc, openai.AuthenticationError):
+        logger.error("OpenAI authentication failed (status %s)", exc.status_code)
+        return AssistantConfigError("The OpenAI API key was rejected.")
+    if isinstance(exc, openai.PermissionDeniedError):
+        logger.error("OpenAI permission denied for model %s", model)
+        return AssistantConfigError(f"The API key has no access to model '{model}'.")
+    if isinstance(exc, openai.NotFoundError):
+        logger.error("OpenAI model not found: %s", model)
+        return AssistantConfigError(
+            f"Model '{model}' was not found. Check OPENAI_MODEL / OPENAI_TRANSCRIBE_MODEL / "
+            "OPENAI_TTS_MODEL.")
+    if isinstance(exc, openai.BadRequestError):
+        logger.error("OpenAI rejected the request (model %s): %s", model, exc.message)
+        return AssistantConfigError(
+            f"OpenAI rejected the request for model '{model}'. Check OPENAI_MODEL and "
+            "OPENAI_REASONING_EFFORT (see server log)."
+        )
+    if isinstance(exc, (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError)):
+        logger.warning("OpenAI temporarily unavailable: %s", type(exc).__name__)
+        return AssistantUnavailableError("The AI service is temporarily unavailable.")
+    if isinstance(exc, openai.APIStatusError):
+        logger.error("OpenAI API error (status %s)", exc.status_code)
+        return AssistantUnavailableError("The AI service returned an error.")
+    logger.error("OpenAI client error: %s", type(exc).__name__)
+    return AssistantUnavailableError("The AI service could not be reached.")
