@@ -11,6 +11,7 @@ import logging
 from functools import wraps
 
 from django.conf import settings
+from django.core.exceptions import RequestDataTooBig
 from django.db import DatabaseError, connection
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -23,6 +24,11 @@ from .services.orchestrator import MAX_MESSAGE_LENGTH, Orchestrator
 from .services.session import DEVICE_SESSION_LOCK, get_device_session
 
 logger = logging.getLogger("assistant.api")
+
+# How long a chat request waits for another in-flight chat request to finish.
+# A device retry while the first request is still running gets 429 instead of
+# queueing up and possibly repeating the same operation.
+CHAT_LOCK_TIMEOUT_SECONDS = 1.0
 
 
 def _error(message: str, status: int) -> JsonResponse:
@@ -75,7 +81,11 @@ def health(request):
 @require_device_token
 def chat(request):
     try:
-        payload = json.loads(request.body.decode("utf-8") or "null")
+        body = request.body
+    except RequestDataTooBig:
+        return _error("Request body is too large.", 413)
+    try:
+        payload = json.loads(body.decode("utf-8") or "null")
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _error("Request body must be valid JSON.", 400)
     if not isinstance(payload, dict):
@@ -86,13 +96,15 @@ def chat(request):
     if len(message) > MAX_MESSAGE_LENGTH:
         return _error(f"'message' must be at most {MAX_MESSAGE_LENGTH} characters.", 400)
 
-    orchestrator = get_orchestrator()
+    if not DEVICE_SESSION_LOCK.acquire(timeout=CHAT_LOCK_TIMEOUT_SECONDS):
+        return _error("Another request is still being processed. Try again shortly.", 429)
     try:
-        with DEVICE_SESSION_LOCK:
-            reply = orchestrator.handle_message(get_device_session(), message)
+        reply = get_orchestrator().handle_message(get_device_session(), message)
     except Exception:
         logger.exception("Unexpected error in chat endpoint")
         return _error("Internal error.", 500)
+    finally:
+        DEVICE_SESSION_LOCK.release()
 
     if not reply.ok:
         return JsonResponse({"status": "error", "reply": reply.text}, status=502)

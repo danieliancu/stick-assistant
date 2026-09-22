@@ -91,6 +91,16 @@ def make_local_aware(day: date, at: time) -> datetime:
     return candidate
 
 
+def is_ambiguous_local(value: datetime) -> bool:
+    """True when the local wall time occurs twice (clocks go back), e.g. 01:30 on the
+    last Sunday of October."""
+    local = to_local(value)
+    naive = local.replace(tzinfo=None)
+    first = naive.replace(tzinfo=local_tz(), fold=0).utcoffset()
+    second = naive.replace(tzinfo=local_tz(), fold=1).utcoffset()
+    return first != second
+
+
 def local_day_bounds(day: date) -> tuple[datetime, datetime]:
     """Aware [start, end) for a local calendar day (handles 23h/25h DST days)."""
     return make_local_aware(day, time(0, 0)), make_local_aware(day + timedelta(days=1), time(0, 0))

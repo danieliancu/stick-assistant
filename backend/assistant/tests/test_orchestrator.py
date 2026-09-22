@@ -256,7 +256,8 @@ class ValidationAndFailureTests(OrchestratorTestCase):
         result = self.say("Adaugă un task mâine la 10")
         self.assertFalse(result.ok)
         self.assertEqual(AgendaItem.objects.count(), 1)
-        self.assertIn("create_item", result.text)
+        self.assertIn("salvate în agendă: creare", result.text)
+        self.assertNotIn("create_item", result.text)  # no internal names shown to the user
 
     def test_missing_api_key_is_friendly_error(self):
         orchestrator = Orchestrator(client=OpenAIResponsesClient(api_key=""),

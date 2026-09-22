@@ -33,11 +33,16 @@ class ConversationSession:
     recent_items: list[str] = field(default_factory=list)
     pending_delete: PendingDelete | None = None
     turn_no: int = 0
+    last_user_message: str = ""
     last_active: datetime = field(default_factory=timezone.now)
 
-    def start_turn(self) -> int:
+    def start_turn(self, user_message: str = "") -> int:
         self.turn_no += 1
+        self.last_user_message = user_message
         self.last_active = timezone.now()
+        # A delete confirmation request is only valid for the very next user turn.
+        if self.pending_delete and self.pending_delete.turn_no < self.turn_no - 1:
+            self.pending_delete = None
         return self.turn_no
 
     def history_items(self) -> list[dict[str, Any]]:

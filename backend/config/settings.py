@@ -113,6 +113,9 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# The device only sends short text messages; reject large bodies early.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 64 * 1024
+
 # --- Security (production) ---------------------------------------------------
 if not DEBUG:
     SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", default=True)

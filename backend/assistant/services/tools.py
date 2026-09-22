@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import unicodedata
 from datetime import date, datetime, time
 from typing import Any, Callable
 
@@ -21,6 +23,7 @@ from assistant.models import AgendaItem
 from . import agenda
 from .datetime_utils import (
     DateTimeValidationError,
+    is_ambiguous_local,
     make_local_aware,
     now_local,
     parse_local_date,
@@ -34,6 +37,10 @@ logger = logging.getLogger("assistant.tools")
 MAX_TITLE_LENGTH = 200
 MAX_TEXT_LENGTH = 2000
 MAX_RECENT_LISTED = 5  # listed items remembered as recent references
+AMBIGUOUS_TIME_WARNING = (
+    "This local time occurs twice because the clocks go back; the first occurrence (BST) "
+    "was used. Mention this to the user."
+)
 
 
 class ToolArgumentError(ValueError):
@@ -259,6 +266,8 @@ def _create_item(args: dict, ctx: ToolContext) -> dict:
     extra = {"created": True}
     if when is not None and _is_past(when, has_time, ctx.clock):
         extra["warning"] = "The saved date/time is in the past. Mention this to the user."
+    elif when is not None and has_time and is_ambiguous_local(when):
+        extra["warning"] = AMBIGUOUS_TIME_WARNING
     return _item_result(item, **extra)
 
 
@@ -358,7 +367,11 @@ def _update_item(args: dict, ctx: ToolContext) -> dict:
 
     updated = agenda.update_item(item.id, **fields)
     ctx.session.remember(updated.id)
-    return _item_result(updated, updated=True, changed_fields=sorted(fields))
+    extra = {}
+    new_when = fields.get("starts_at") or fields.get("due_at")
+    if new_when is not None and fields.get("due_has_time", True) and is_ambiguous_local(new_when):
+        extra["warning"] = AMBIGUOUS_TIME_WARNING
+    return _item_result(updated, updated=True, changed_fields=sorted(fields), **extra)
 
 
 def _complete_item(args: dict, ctx: ToolContext) -> dict:
@@ -368,6 +381,34 @@ def _complete_item(args: dict, ctx: ToolContext) -> dict:
     return _item_result(item, completed=True)
 
 
+_NEGATIVE_WORDS = {
+    "nu", "no", "not", "nope", "dont", "don't", "cancel", "anuleaza", "anulează", "stop",
+    "renunt", "renunț", "renunta", "lasa", "lasă", "nevermind", "wait", "stai", "asteapta",
+}
+_AFFIRMATIVE_WORDS = {
+    "da", "yes", "yep", "yeah", "y", "ok", "okay", "sure", "confirm", "confirmed", "confirma",
+    "confirmat", "sigur", "desigur", "corect", "sterge", "sterge-l", "sterge-o",
+    "delete", "remove", "go", "do",
+}
+
+
+def _tokens(text: str) -> list[str]:
+    decomposed = unicodedata.normalize("NFKD", (text or "").lower())
+    plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.findall(r"[a-z']+", plain)
+
+
+def is_explicit_confirmation(text: str) -> bool:
+    """
+    Deterministic check that the user's own message confirms a deletion.
+    Any negation wins, so "nu", "no, wait" or "da, dar nu acum" never confirm.
+    """
+    tokens = _tokens(text)
+    if not tokens or any(t in _NEGATIVE_WORDS for t in tokens):
+        return False
+    return any(t in _AFFIRMATIVE_WORDS for t in tokens)
+
+
 def _delete_item(args: dict, ctx: ToolContext) -> dict:
     _check_keys(args, {"item_id", "confirmed"})
     item = agenda.get_item(_req_str(args, "item_id", 64))
@@ -375,20 +416,31 @@ def _delete_item(args: dict, ctx: ToolContext) -> dict:
     session = ctx.session
     item_id = str(item.id)
     pending = session.pending_delete
-
-    # Deletion only runs when the user confirmed in the turn right after the
-    # confirmation request for this exact item. The model cannot self-confirm.
-    if (
-        confirmed
-        and pending is not None
+    confirmable = (
+        pending is not None
         and pending.item_id == item_id
         and pending.turn_no == session.turn_no - 1
-    ):
-        snapshot = agenda.delete_item(item_id)
-        session.forget(item_id)
-        return {"ok": True, "deleted": True, "item": snapshot}
+    )
 
-    if pending is None or pending.item_id != item_id or pending.turn_no < session.turn_no - 1:
+    # Deletion only runs when (1) the confirmation request for this exact item was
+    # made in the previous turn and (2) the user's own latest message is an explicit
+    # confirmation. The model's "confirmed" flag alone is never enough.
+    if confirmed and confirmable:
+        if is_explicit_confirmation(session.last_user_message):
+            snapshot = agenda.delete_item(item_id)
+            session.forget(item_id)
+            return {"ok": True, "deleted": True, "item": snapshot}
+        session.pending_delete = None
+        return {
+            "ok": False,
+            "deleted": False,
+            "error": "not_confirmed",
+            "message": "The user's latest message is not an explicit confirmation. Nothing "
+                       "was deleted and the delete request was cancelled.",
+            "item": agenda.serialize_item(item),
+        }
+
+    if not confirmable:
         session.pending_delete = PendingDelete(item_id=item_id, turn_no=session.turn_no)
     session.remember(item_id)
     return {

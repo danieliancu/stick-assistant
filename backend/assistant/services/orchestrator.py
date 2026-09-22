@@ -33,6 +33,8 @@ The agenda lives in a database you can only access through the provided tools.
 Language and style:
 - Reply in the language of the user's latest message (Romanian or English).
 - Be brief and natural: one or two short sentences, no greetings or filler.
+- Plain text only: no Markdown, bullet lists, bold or emoji (replies are shown on a tiny
+  screen and will later be spoken aloud).
 - Say dates naturally (e.g. "mâine la 10", "vineri, 25 septembrie", "tomorrow at 10:00").
 
 Truthfulness (critical):
@@ -96,7 +98,9 @@ _MESSAGES = {
         "limit": "Nu am putut finaliza cererea. Te rog reformulează.",
         "no_text": "Nu am putut genera un răspuns.",
         "error": "Asistentul nu este disponibil momentan: {detail}",
-        "partial": "Operațiile au fost executate ({done}), dar nu am putut genera răspunsul.",
+        "partial": "Atenție: următoarele operații au fost totuși salvate în agendă: {done}.",
+        "actions": {"create_item": "creare", "update_item": "modificare",
+                    "complete_item": "finalizare", "delete_item": "ștergere"},
     },
     "en": {
         "empty": "I didn't receive a message.",
@@ -104,7 +108,9 @@ _MESSAGES = {
         "limit": "I couldn't complete the request. Please rephrase it.",
         "no_text": "I couldn't generate a reply.",
         "error": "The assistant is currently unavailable: {detail}",
-        "partial": "The operations were carried out ({done}), but I couldn't generate a reply.",
+        "partial": "Note: these operations were still saved to the agenda: {done}.",
+        "actions": {"create_item": "create", "update_item": "update",
+                    "complete_item": "complete", "delete_item": "delete"},
     },
 }
 
@@ -155,9 +161,12 @@ def _output_text(response: Any) -> str:
     parts = []
     for item in getattr(response, "output", None) or []:
         if getattr(item, "type", None) == "message":
-            parts.extend(
-                c.text for c in item.content if getattr(c, "type", None) == "output_text"
-            )
+            for content in item.content:
+                content_type = getattr(content, "type", None)
+                if content_type == "output_text":
+                    parts.append(content.text)
+                elif content_type == "refusal":
+                    parts.append(content.refusal)
     return "".join(parts).strip()
 
 
@@ -219,7 +228,7 @@ class Orchestrator:
         if len(text) > MAX_MESSAGE_LENGTH:
             return AssistantReply(msgs["too_long"], status="error")
 
-        session.start_turn()
+        session.start_turn(text)
         instructions = self.build_instructions(session)
         turn_items: list[dict] = [{"role": "user", "content": text}]
         actions: list[dict[str, Any]] = []
@@ -232,7 +241,13 @@ class Orchestrator:
                 output = getattr(response, "output", None) or []
                 calls = [item for item in output if getattr(item, "type", None) == "function_call"]
                 if not calls:
-                    reply_text = _output_text(response) or msgs["no_text"]
+                    reply_text = _output_text(response)
+                    if not reply_text:
+                        # e.g. status "incomplete" (token limit) or an empty output.
+                        logger.warning("Model returned no text (status=%s)",
+                                       getattr(response, "status", None))
+                        return self._failure(session, turn_items, actions, msgs,
+                                             msgs["no_text"])
                     turn_items.append({"role": "assistant", "content": reply_text})
                     session.commit_turn(_compact_for_history(turn_items))
                     return AssistantReply(reply_text, status="success", actions=actions)
@@ -242,7 +257,14 @@ class Orchestrator:
                     if converted is not None:
                         turn_items.append(converted)
                 for call in calls:
-                    result = execute_tool(call.name, call.arguments, session, clock=self.clock)
+                    try:
+                        result = execute_tool(call.name, call.arguments, session,
+                                              clock=self.clock)
+                    except Exception:
+                        # A bug in a handler must not hide what already happened this turn.
+                        logger.exception("Unexpected error in tool %s", call.name)
+                        result = {"ok": False, "error": "internal_error",
+                                  "message": "The operation failed unexpectedly."}
                     actions.append({
                         "tool": call.name,
                         "ok": bool(result.get("ok")),
@@ -264,7 +286,8 @@ class Orchestrator:
 
     @staticmethod
     def _failure(session, turn_items, actions, msgs, text) -> AssistantReply:
-        done = [a["tool"] for a in actions if a["ok"] and a["tool"] in MUTATING_TOOLS]
+        done = [msgs["actions"][a["tool"]] for a in actions
+                if a["ok"] and a["tool"] in MUTATING_TOOLS]
         if done:
             # Be honest that the database did change even though the reply failed.
             text = f"{text} {msgs['partial'].format(done=', '.join(done))}"

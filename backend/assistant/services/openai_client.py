@@ -105,8 +105,8 @@ class OpenAIResponsesClient:
         except openai.BadRequestError as exc:
             logger.error("OpenAI rejected the request (model %s): %s", self.model, exc.message)
             raise AssistantConfigError(
-                f"OpenAI rejected the request. Check that model '{self.model}' supports the "
-                "Responses API and function calling."
+                f"OpenAI rejected the request for model '{self.model}'. Check OPENAI_MODEL and "
+                "OPENAI_REASONING_EFFORT (see server log)."
             ) from exc
         except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError) as exc:
             logger.warning("OpenAI temporarily unavailable: %s", type(exc).__name__)

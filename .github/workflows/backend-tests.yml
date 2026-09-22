@@ -1,0 +1,54 @@
+name: Backend tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # Safe, non-secret values. OpenAI is mocked in every test; no real key is used,
+      # so CI never makes paid API calls.
+      DJANGO_SECRET_KEY: ci-only-insecure-secret-key-not-used-anywhere-else-0123456789
+      DJANGO_DEBUG: "False"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+      DEVICE_API_TOKEN: ci-device-token
+      OPENAI_API_KEY: ""
+      OPENAI_MODEL: gpt-5.6-luna
+      PYTHONUTF8: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Django system checks
+        run: python manage.py check
+
+      - name: Deployment checks
+        run: python manage.py check --deploy
+
+      - name: Verify migrations are up to date
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run test suite
+        run: python manage.py test assistant -v 2

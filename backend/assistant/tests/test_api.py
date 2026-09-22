@@ -3,14 +3,18 @@ from datetime import datetime
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import httpx
+import openai
+from django.db import DatabaseError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from assistant import views
 from assistant.models import AgendaItem
 from assistant.services import agenda
+from assistant.services.openai_client import OpenAIResponsesClient
 from assistant.services.orchestrator import Orchestrator
-from assistant.services.session import reset_device_session
+from assistant.services.session import DEVICE_SESSION_LOCK, reset_device_session
 from assistant.tests.helpers import (
     FIXED_NOW,
     FakeResponsesClient,
@@ -28,7 +32,9 @@ def aware(*args):
     return datetime(*args, tzinfo=LONDON)
 
 
-@override_settings(DEVICE_API_TOKEN=TOKEN)
+# SECURE_SSL_REDIRECT is on when DJANGO_DEBUG is false (e.g. in CI); disable it here so
+# the suite behaves the same in every environment. The redirect has its own test below.
+@override_settings(DEVICE_API_TOKEN=TOKEN, SECURE_SSL_REDIRECT=False)
 class ApiTestCase(TestCase):
     def setUp(self):
         reset_device_session()
@@ -45,6 +51,16 @@ class ApiTestCase(TestCase):
         data = body if raw else json.dumps(body)
         return self.client.post(reverse("assistant:chat"), data=data,
                                 content_type="application/json", **headers)
+
+
+class HttpsRedirectTests(TestCase):
+    @override_settings(SECURE_SSL_REDIRECT=True, DEVICE_API_TOKEN=TOKEN)
+    def test_plain_http_is_redirected_to_https_in_production(self):
+        res = self.client.get(reverse("assistant:health"))
+        self.assertEqual(res.status_code, 301)
+        self.assertTrue(res["Location"].startswith("https://"))
+        self.assertEqual(self.client.get(reverse("assistant:health"), secure=True).status_code,
+                         200)
 
 
 class HealthTests(ApiTestCase):
@@ -160,3 +176,66 @@ class AgendaTodayApiTests(ApiTestCase):
     def test_requires_token(self):
         self.assertEqual(self.get_today(token=None).status_code, 401)
         self.assertEqual(self.get_today(token="bad").status_code, 401)
+
+
+class ApiHardeningTests(ApiTestCase):
+    def test_oversized_body_returns_413(self):
+        res = self.post_chat(json.dumps({"message": "x" * 70_000}), raw=True)
+        self.assertEqual(res.status_code, 413)
+        self.assertEqual(res.json()["status"], "error")
+
+    def test_concurrent_chat_returns_429_instead_of_queueing(self):
+        DEVICE_SESSION_LOCK.acquire()
+        try:
+            with mock.patch.object(views, "CHAT_LOCK_TIMEOUT_SECONDS", 0.01):
+                res = self.post_chat({"message": "hi"})
+        finally:
+            DEVICE_SESSION_LOCK.release()
+        self.assertEqual(res.status_code, 429)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_health_and_agenda_not_blocked_by_chat_lock(self):
+        DEVICE_SESSION_LOCK.acquire()
+        try:
+            self.assertEqual(self.client.get(reverse("assistant:health")).status_code, 200)
+            res = self.client.get(reverse("assistant:agenda-today"),
+                                  HTTP_AUTHORIZATION=f"Bearer {TOKEN}")
+            self.assertEqual(res.status_code, 200)
+        finally:
+            DEVICE_SESSION_LOCK.release()
+
+    def test_database_failure_on_agenda_returns_generic_500(self):
+        with mock.patch.object(agenda, "list_items", side_effect=DatabaseError("db at C:/x")):
+            res = self.client.get(reverse("assistant:agenda-today"),
+                                  HTTP_AUTHORIZATION=f"Bearer {TOKEN}")
+        self.assertEqual(res.status_code, 500)
+        self.assertNotIn("C:/x", res.content.decode())
+
+    def test_database_failure_during_chat_is_not_reported_as_success(self):
+        def check(instructions, input_items):
+            self.assertEqual(json.loads(input_items[-1]["output"])["error"], "database_error")
+            return response(message("Nu am putut salva."))
+
+        self.fake.add(response(function_call("create_item", {
+            "type": "TASK", "title": "x", "description": None, "date": None, "time": None})),
+            check)
+        with mock.patch.object(agenda, "create_item", side_effect=DatabaseError("locked")):
+            res = self.post_chat({"message": "Adaugă task x"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(AgendaItem.objects.count(), 0)
+
+    def test_api_key_never_in_response_or_logs(self):
+        secret = "sk-test-SECRET-value-123"
+        client = OpenAIResponsesClient(api_key=secret, model="gpt-5.6-luna")
+        client._client = mock.MagicMock()
+        req = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        client._client.responses.create.side_effect = openai.AuthenticationError(
+            f"Incorrect API key provided: {secret}",
+            response=httpx.Response(401, request=req), body=None)
+        with mock.patch.object(views, "get_orchestrator",
+                               return_value=Orchestrator(client=client, clock=fixed_clock())):
+            with self.assertLogs("assistant", level="DEBUG") as logs:
+                res = self.post_chat({"message": "hi"})
+        self.assertEqual(res.status_code, 502)
+        self.assertNotIn(secret, res.content.decode())
+        self.assertNotIn(secret, "\n".join(logs.output))

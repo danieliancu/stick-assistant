@@ -26,8 +26,11 @@ speech-to-text or text-to-speech yet.
 - **No fabricated results:** the model can only change data through six tools.
   The server validates every argument, and a tool reports `"ok": true` only
   after the database operation actually succeeded.
-- **Safe deletes:** a delete runs only when the user confirms in the message
-  *after* the assistant asked. This is enforced in code, not only in the prompt.
+- **Safe deletes:** a delete runs only when the user's *next* message, after
+  the assistant asked, is an explicit yes ("da", "yes", "confirm", "șterge-l").
+  The server checks the user's own words, not only the model's flag. Any
+  negation ("nu", "no, wait") cancels the request, and an unanswered request
+  expires after one turn.
 - **Timezone:** Europe/London, with correct GMT/BST handling. Non-existent local
   times (the spring-forward gap) are rejected.
 
@@ -96,8 +99,19 @@ notepad .env
 | Variable | Required | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | yes | Your OpenAI API key. Keep it only in `.env` or your environment. |
-| `OPENAI_MODEL` | no (default `gpt-5.6-luna`) | Any model that supports the Responses API and function calling |
+| `OPENAI_MODEL` | no (default `gpt-5.6-luna`) | Any model that supports the Responses API and function calling. If the model is wrong, you get a clear error; the app never switches to another model on its own. |
 | `OPENAI_REASONING_EFFORT` | no (default `low`) | `none`/`low`/`medium`/`high` for reasoning models; `off` omits the parameter |
+
+Default model check (22/09/2026):
+- `gpt-5.6-luna` is listed in OpenAI's model docs as the cost-optimised
+  GPT-5.6 model. It supports the Responses API, function calling and
+  structured outputs, with reasoning effort from `none` to `max`, at
+  $0.20 / $1.20 per million input/output tokens.
+- It is returned by `GET /v1/models` for the configured key.
+- It passed the live check below using exactly the app's request parameters:
+  `store=False`, `reasoning.effort=low`,
+  `include=["reasoning.encrypted_content"]`, strict function tools and
+  `parallel_tool_calls`.
 | `DJANGO_SECRET_KEY` | yes in production | Long random string |
 | `DJANGO_DEBUG` | no (default `False`) | `True` for local development |
 | `DJANGO_ALLOWED_HOSTS` | no | Comma-separated, default `localhost,127.0.0.1` |
@@ -185,25 +199,60 @@ curl -X POST http://127.0.0.1:8000/api/chat/ \
   -d '{"message": "What do I have tomorrow?"}'
 ```
 
-Status codes: `400` invalid payload, `401` missing or invalid token, `405` wrong
-method, `502` AI service or configuration error, `503` `DEVICE_API_TOKEN` not
-configured on the server. Error responses never include internal details.
+Status codes:
+
+| Code | Meaning |
+|---|---|
+| `400` | Invalid payload (bad JSON, missing, empty or >1000-character `message`) |
+| `401` | Missing or invalid token |
+| `405` | Wrong method |
+| `413` | Body larger than 64 KB |
+| `429` | Another chat request is still running. Retry shortly; this stops a retry from repeating an operation. |
+| `500` | Unexpected server or database error (generic message only) |
+| `502` | AI service or configuration error. If the database changed before the failure, the reply says so. |
+| `503` | `DEVICE_API_TOKEN` not configured on the server |
+
+Error responses never include stack traces, internal details or the OpenAI key.
+Only `/api/chat/` waits on the device session; `/api/health/` and
+`/api/agenda/today/` are never blocked by a running OpenAI request.
+
+With `DJANGO_DEBUG=False`, plain HTTP requests are redirected to HTTPS
+(`DJANGO_SECURE_SSL_REDIRECT=False` turns this off if TLS is terminated
+elsewhere).
 
 ## 9. Tests
 
 ```powershell
 python manage.py test assistant -v 2
 python manage.py check
+python manage.py check --deploy
 python manage.py makemigrations --check --dry-run
 ```
 
 The tests never call OpenAI. The model is replaced by a scripted fake client
 (`assistant/tests/helpers.py`) and the clock is fixed, so runs are
-deterministic. The tests cover models, the agenda service, date and DST
-handling, tool validation, the orchestration loop, follow-up references,
-ambiguity, delete confirmation, error handling and the HTTP API.
-**A passing suite does not prove the live OpenAI connection works.** To check
-that, run `assistant_chat` with a real key.
+deterministic. They give the same result with `DJANGO_DEBUG` set to `True` or
+`False`. The tests cover models, the agenda service, date and DST handling,
+tool validation, the orchestration loop, follow-up references, ambiguity,
+delete confirmation, error handling and the HTTP API. Regression tests for
+defects found in the audit are in `test_regressions.py`.
+
+**CI:** `.github/workflows/backend-tests.yml` runs the checks and the full suite
+on every push to `main` and on every pull request to `main`. It uses Python 3.11,
+safe dummy settings and no OpenAI key, so it makes no paid API calls.
+
+**Live OpenAI check (optional, uses your API key and costs a few API calls):**
+
+```powershell
+python manage.py assistant_live_check
+```
+
+This runs a real Romanian and English conversation: create a task, list it,
+move it with "Mută-l la ora 12", complete it, list completed tasks, ask for a
+missing appointment time, create an appointment, list it, and delete it with
+confirmation. It checks SQLite after each step, then removes only the records
+it created. **A passing unit test suite does not prove the live connection
+works; this command does.**
 
 ## 10. Current limitations
 
@@ -217,7 +266,11 @@ that, run `assistant_chat` with a real key.
   whether the model picked the day the user meant. Replies say the date back so
   the user can correct it.
 - "next Friday" means the Friday of next week (Monday–Sunday).
-- In the ambiguous autumn DST hour, the first (BST) occurrence is used.
+- In the ambiguous autumn DST hour, the first (BST) occurrence is used, and the
+  assistant is told to mention this to the user.
+- Checking a delete confirmation relies on a list of yes/no words in Romanian
+  and English. Unusual phrasing is treated as "not confirmed", which is the safe
+  outcome: the assistant simply asks again.
 - `check --deploy` warns about HSTS until `DJANGO_HSTS_SECONDS` is set. Enable it
   only when the site is served exclusively over HTTPS.
 
