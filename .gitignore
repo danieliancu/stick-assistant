@@ -1,0 +1,21 @@
+# Secrets
+.env
+*.env
+!.env.example
+
+# SQLite database
+*.sqlite3
+*.sqlite3-journal
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+staticfiles/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
